@@ -1,0 +1,301 @@
+# HOWTO: Set Up Windows VS Code with a Remote SSH Server
+
+This guide walks through configuring **VS Code on Windows** to develop against a **remote Linux SSH server** using the Remote - SSH extension. It covers SSH login configuration, key-based authentication, the Remote - SSH extension, remote extension installation, and MCP (Model Context Protocol) server configuration.
+
+---
+
+## 1. Prerequisites
+
+| Item | Where | Notes |
+|------|-------|-------|
+| VS Code | Windows 10/11 | Download from <https://code.visualstudio.com> |
+| OpenSSH client | Windows | Usually pre-installed. Verify: `ssh -V` in PowerShell |
+| Remote server access | — | Hostname/IP, username, and credentials (password or key) |
+| Network reachability | — | VPN connected if the server is on a corporate network |
+
+### Verify / install the Windows OpenSSH client
+
+Open **PowerShell** and run:
+
+```powershell
+ssh -V
+```
+
+If it is missing, install it:
+
+```powershell
+# Run PowerShell as Administrator
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+```
+
+---
+
+## 2. Configure SSH Login
+
+### 2.1 Generate an SSH key pair (recommended over passwords)
+
+In PowerShell:
+
+```powershell
+ssh-keygen -t ed25519 -C "your_email@example.com"
+```
+
+- Press **Enter** to accept the default location: `C:\Users\<you>\.ssh\id_ed25519`
+- Optionally set a passphrase (recommended).
+
+This creates:
+- `id_ed25519` — **private key** (keep secret, never share)
+- `id_ed25519.pub` — **public key** (safe to copy to servers)
+
+### 2.2 Copy your public key to the remote server
+
+PowerShell does not include `ssh-copy-id`, so use this one-liner:
+
+```powershell
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@remote-host "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Replace `user@remote-host` with your username and server address. Enter your password once when prompted. Subsequent logins will use the key.
+
+### 2.3 Create an SSH config file
+
+Create or edit `C:\Users\<you>\.ssh\config` (no extension). This lets you define named hosts, jump hosts, and options.
+
+```sshconfig
+# ~/.ssh/config
+
+Host myserver
+    HostName 10.0.0.42
+    User jung
+    IdentityFile ~/.ssh/id_ed25519
+    ForwardAgent yes
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+# Example: connecting through a bastion / jump host
+Host internal-server
+    HostName 192.168.1.100
+    User jung
+    ProxyJump bastion.example.com
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+> **Tip:** `ServerAliveInterval` keeps idle SSH sessions from dropping — useful for long remote dev sessions.
+
+### 2.4 Test the connection
+
+```powershell
+ssh myserver
+```
+
+You should land on the remote shell without a password prompt (a passphrase prompt for the key is normal if you set one).
+
+---
+
+## 3. Handling Confidential / Secure SSH Logins
+
+For environments that require extra authentication (MFA, smart cards, corporate CA, or confidential credentials):
+
+### 3.1 Use the SSH agent (avoid re-typing passphrases)
+
+Enable and start the Windows `ssh-agent` service once (as Administrator):
+
+```powershell
+Set-Service ssh-agent -StartupType Automatic
+Start-Service ssh-agent
+```
+
+Add your key to the agent:
+
+```powershell
+ssh-add $env:USERPROFILE\.ssh\id_ed25519
+```
+
+The agent caches the decrypted key so you enter the passphrase only once per session. With `ForwardAgent yes` in the config, the remote host can use your local key for onward connections (e.g., git over SSH) **without copying the private key to the server**.
+
+### 3.2 Multi-factor / one-time password prompts
+
+If the server uses keyboard-interactive MFA, VS Code will show the prompt in the **Remote - SSH** output. Do not store OTPs or passwords in the config file. Keep secrets out of `config`, `settings.json`, and any committed files.
+
+### 3.3 Protect your credentials
+
+- **Never** commit private keys, `authorized_keys`, or passwords to source control.
+- Store the private key only in `%USERPROFILE%\.ssh\` with restricted permissions.
+- Prefer key + passphrase + agent over plaintext passwords.
+- Use `ProxyJump` for bastion hosts instead of embedding credentials.
+- If a key is ever exposed, remove it from every server's `authorized_keys` and rotate it immediately.
+
+---
+
+## 4. Install and Configure the Remote - SSH Extension
+
+### 4.1 Install the extension
+
+1. Open VS Code on Windows.
+2. Open the **Extensions** view (`Ctrl+Shift+X`).
+3. Search for **Remote - SSH** (publisher: Microsoft) and click **Install**.
+   - Optionally install the **Remote Development** extension pack for SSH + Containers + WSL.
+
+### 4.2 Connect to the remote host
+
+1. Press `F1` (or `Ctrl+Shift+P`) and run **Remote-SSH: Connect to Host…**
+2. Select `myserver` (from your `~/.ssh/config`) or choose **Add New SSH Host…**
+3. A new VS Code window opens and installs the **VS Code Server** on the remote host automatically (first connect takes a moment).
+4. The bottom-left green status bar shows **SSH: myserver** when connected.
+
+### 4.3 Open your remote workspace
+
+- **File → Open Folder…** and pick the remote path (e.g., `/home/jung/EST`).
+- The window now operates entirely on the remote filesystem.
+
+---
+
+## 5. Install Extensions on the Remote Host
+
+VS Code extensions run in one of two places:
+
+- **UI (local)** — themes, keymaps: stay on Windows.
+- **Workspace (remote)** — language servers, linters, debuggers: must be installed **on the remote host**.
+
+To install a remote extension:
+
+1. While connected via SSH, open the **Extensions** view.
+2. Extensions already installed locally show **Install in SSH: myserver**. Click it.
+3. New extensions install to the remote by default while connected.
+
+To make extensions install automatically on every remote host, add to your **remote** `settings.json`:
+
+```jsonc
+{
+  "remote.SSH.defaultExtensions": [
+    "ms-python.python",
+    "ms-vscode.cpptools",
+    "github.copilot",
+    "github.copilot-chat"
+  ]
+}
+```
+
+> **Note:** GitHub Copilot and Copilot Chat must be enabled on the remote side to use AI features against remote code.
+
+---
+
+## 6. Configure MCP (Model Context Protocol) Servers
+
+MCP servers extend Copilot/agent tooling (e.g., Vivado, document generation, issue trackers). On a Remote-SSH setup, the MCP servers run **on the remote host**, so the configuration must live on the remote filesystem.
+
+### 6.1 Where the MCP config lives (Remote-SSH)
+
+When you connect via Remote-SSH, VS Code reads the **remote user** MCP file:
+
+```
+~/.vscode-server/data/User/mcp.json
+```
+
+This is the file that is active for your Remote-SSH sessions on this host. It applies to **that Linux user across all workspaces** opened on the remote machine.
+
+> Note: `~/.config/Code/User/mcp.json` belongs to a **locally-installed** Linux VS Code and is **not** used by Remote-SSH sessions. A workspace-scoped `.vscode/mcp.json` inside the opened folder is also supported, but this guide targets the per-user remote file.
+
+### 6.2 Create / edit the file
+
+```bash
+mkdir -p ~/.vscode-server/data/User
+# edit the file (create if missing)
+code ~/.vscode-server/data/User/mcp.json
+```
+
+Example `~/.vscode-server/data/User/mcp.json`:
+
+```jsonc
+{
+  "servers": {
+    "code_generation": {
+      "type": "http",
+      "url": "https://mcp-platform.amd.com/mcp/code_generation/"
+    },
+    "spec-search": {
+      "type": "http",
+      "url": "http://10.170.38.14:8081/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:spec_search_token}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "spec_search_token",
+      "type": "promptString",
+      "description": "Bearer token for the spec-search MCP server",
+      "password": true
+    }
+  ]
+}
+```
+
+Key points:
+- `type: "http"` connects to a hosted MCP endpoint.
+- Use the `inputs` block with `"password": true` so secrets (e.g., the `spec-search` Bearer token) are **prompted at runtime**, never stored in plaintext.
+
+### 6.3 Keep MCP secrets out of plaintext
+
+- **Never** hardcode tokens, API keys, or passwords directly in `mcp.json`.
+- Use `${input:...}` prompts (as above) for all credentials.
+- Restrict the file: `chmod 600 ~/.vscode-server/data/User/mcp.json`.
+- If a token was ever written in plaintext, **rotate it** — it may persist in backups or logs.
+- Only connect to **authorized** MCP servers approved by your organization.
+
+### 6.4 Start / manage MCP servers
+
+1. Open the **Command Palette** (`F1`) → **MCP: List Servers**.
+2. Select a server to **Start**, **Stop**, or view its **Output** logs.
+3. In Copilot Chat (agent mode), the server's tools become available once it reports **running**.
+
+---
+
+## 7. Common Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| Stuck on "Setting up SSH Host" | Slow first-time server download | Wait; check **Remote - SSH** output panel |
+| `Permission denied (publickey)` | Key not in `authorized_keys` or wrong perms | Re-run step 2.2; ensure `~/.ssh` is `700`, `authorized_keys` is `600` |
+| Passphrase prompted every time | ssh-agent not running / key not added | Do step 3.1 |
+| Connection drops when idle | No keepalive | Add `ServerAliveInterval 60` to `~/.ssh/config` |
+| Extension missing remotely | Installed only locally | Click **Install in SSH: …** (step 5) |
+| MCP server not listed | Config scope / syntax | Validate `~/.vscode-server/data/User/mcp.json`; check **MCP: List Servers** output |
+| Jump host fails | Bastion unreachable | Verify `ProxyJump` host and VPN |
+
+### Useful commands
+
+```powershell
+# Verbose SSH to debug auth problems
+ssh -v myserver
+
+# Re-add key to agent
+ssh-add $env:USERPROFILE\.ssh\id_ed25519
+
+# List keys loaded in the agent
+ssh-add -l
+```
+
+In VS Code:
+- **Remote-SSH: Kill VS Code Server on Host…** — resets a corrupted remote server install.
+- **Output → Remote - SSH** — shows the full connection log.
+
+---
+
+## 8. Quick Reference Checklist
+
+- [ ] OpenSSH client installed on Windows (`ssh -V`)
+- [ ] Ed25519 key pair generated
+- [ ] Public key copied to the server's `authorized_keys`
+- [ ] `~/.ssh/config` host entry created and tested (`ssh myserver`)
+- [ ] ssh-agent running; key added
+- [ ] **Remote - SSH** extension installed
+- [ ] Connected to host; remote folder opened
+- [ ] Required extensions installed **in SSH: host**
+- [ ] `~/.vscode-server/data/User/mcp.json` created on the remote with secrets prompted (not stored)
+- [ ] MCP servers started via **MCP: List Servers**
+
+---
+
+**Security reminder:** Keep private keys, passphrases, OTPs, and MCP tokens out of config files and source control. Prefer key-based auth with an agent, prompt for secrets at runtime, and only connect to authorized servers and MCP endpoints.
